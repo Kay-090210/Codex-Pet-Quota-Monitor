@@ -1,0 +1,36 @@
+# 凭据与个人运行配置
+.codex/
+.env
+.env.*
+!.env.example
+auth.json
+auth.*.json
+config.local.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# 本地输出、真实账户验证记录与个人素材
+backups/
+pet-runs/
+verification/
+previews/
+test-results/
+TestResults/
+*-verification.json
+live-*.json
+live-*.png
+*.log
+*.tmp
+*.bak
+*.zip
+*.7z
+
+# 编辑器与操作系统缓存
+.vscode/
+.idea/
+__pycache__/
+Thumbs.db
+Desktop.ini
+.DS_Store
