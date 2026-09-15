@@ -34,3 +34,9 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# 本地项目维护约定，不纳入发布
+AGENTS.md
+
+# 本机可选 ping 登录环境与状态（不发布）
+.codex-pet-local/

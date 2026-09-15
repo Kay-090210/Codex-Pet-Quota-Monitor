@@ -7,17 +7,23 @@ param(
     [switch]$PositionSelfTest,
     [switch]$UiSelfTest,
     [string]$PreviewDirectory,
-    [switch]$ProbeOnce
+    [switch]$ProbeOnce,
+    [switch]$PingSettings,
+    [switch]$CheckPingLogin
 )
 
 $ErrorActionPreference = 'Stop'
+
+. (Join-Path $PSScriptRoot 'CodexQuotaPing.ps1')
 
 $script:MutexName = 'Local\CodexPetQuotaOverlay.SingleInstance'
 $script:StopEventName = 'Local\CodexPetQuotaOverlay.Stop'
 $script:PanelWidthDip = 96.0
 $script:PanelHeightDip = 232.0
-# 为比角色更宽的任务文字卡片预留横向空间，按桌宠所在屏幕的 DPI 缩放。
-$script:PanelGapDip = 84.0
+$script:HorizontalPanelWidthDip = 192.0
+$script:HorizontalPanelHeightDip = 116.0
+# 常态只和角色保留轻微间距；任务卡片出现后改为上下避让。
+$script:PanelGapDip = 8.0
 
 function Send-StopSignal {
     try {
@@ -429,6 +435,11 @@ public sealed class CodexAppServerClient : IDisposable
 
     public void Start(string executablePath, string workingDirectory)
     {
+        StartWithHome(executablePath, workingDirectory, null);
+    }
+
+    public void StartWithHome(string executablePath, string workingDirectory, string codexHome)
+    {
         Stop();
         var psi = new ProcessStartInfo
         {
@@ -443,6 +454,16 @@ public sealed class CodexAppServerClient : IDisposable
             RedirectStandardError = true
         };
 
+        if (!String.IsNullOrEmpty(codexHome))
+        {
+            var keys = new System.Collections.Generic.List<string>();
+            foreach (string key in psi.EnvironmentVariables.Keys)
+                if (key.StartsWith("CODEX_", StringComparison.OrdinalIgnoreCase) || key.Equals("OPENAI_API_KEY", StringComparison.OrdinalIgnoreCase)) keys.Add(key);
+            foreach (string key in keys) psi.EnvironmentVariables.Remove(key);
+            psi.EnvironmentVariables["CODEX_HOME"] = codexHome;
+        }
+        psi.EnvironmentVariables.Remove("CODEX_SESSION_ID");
+        psi.EnvironmentVariables.Remove("CODEX_THREAD_ID");
         _process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         _process.OutputDataReceived += (sender, args) =>
         {
@@ -451,7 +472,17 @@ public sealed class CodexAppServerClient : IDisposable
         // stderr 必须持续读取以避免管道阻塞；内容不落盘，也不进入 UI。
         _process.ErrorDataReceived += (sender, args) => { var ignored = args.Data; };
 
-        if (!_process.Start()) throw new InvalidOperationException("Failed to start codex app-server.");
+        // .NET Framework 在 Process.Start 内创建 AutoFlush writer 时就可能写出 BOM。
+        // 必须在启动前设置无 BOM 编码；事后重包 BaseStream 已经太迟。
+        Encoding previousInputEncoding = Console.InputEncoding;
+        bool started;
+        try
+        {
+            Console.InputEncoding = new UTF8Encoding(false);
+            started = _process.Start();
+        }
+        finally { Console.InputEncoding = previousInputEncoding; }
+        if (!started) throw new InvalidOperationException("Failed to start codex app-server.");
         AttachKillOnCloseJob(_process);
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
@@ -561,18 +592,24 @@ public sealed class CodexAppServerClient : IDisposable
     private static extern bool CloseHandle(IntPtr handle);
 }
 
+public enum OverlayLayout { Vertical, Horizontal }
+
 public sealed class PetWindowInfo
 {
     public IntPtr Handle { get; set; }
     public NativeWindow.RECT Rect { get; set; }
     public NativeWindow.RECT VisualRect { get; set; }
+    // 当帧的实际内容边界（含任务卡片），独立于防动画抖动的角色锚点。
+    public NativeWindow.RECT ContentRect { get; set; }
+    // 单独保留扁宽任务卡片，供额度面板在角色旁上下避让。
+    public NativeWindow.RECT TaskRect { get; set; }
     public NativeWindow.RECT WorkArea { get; set; }
     public uint Dpi { get; set; }
 }
 
 public sealed class PetAnchorTracker
 {
-    private bool initialized, dragging;
+    private bool initialized, dragging, previousMouseDown;
     private IntPtr handle;
     private uint dpi;
     private NativeWindow.RECT anchor, previousWindow, previousVisual;
@@ -583,10 +620,10 @@ public sealed class PetAnchorTracker
         {
             initialized = true; handle = pet.Handle; dpi = pet.Dpi;
             anchor = pet.VisualRect; previousWindow = pet.Rect; previousVisual = pet.VisualRect;
-            dragging = false;
+            dragging = false; previousMouseDown = mouseDown;
             return anchor;
         }
-        if (mouseDown && !dragging)
+        if (mouseDown && !previousMouseDown && !dragging)
         {
             // 只有从角色区域开始的按压才解锁锚点。
             var r = pet.VisualRect;
@@ -614,6 +651,7 @@ public sealed class PetAnchorTracker
             if (Math.Abs(centerDelta) > threshold || Math.Abs(pet.VisualRect.Bottom - anchor.Bottom) > threshold)
                 anchor = pet.VisualRect;
         }
+        previousMouseDown = mouseDown;
         previousWindow = pet.Rect; previousVisual = pet.VisualRect;
         return anchor;
     }
@@ -672,12 +710,7 @@ public static class NativeWindow
     private const uint PW_RENDERFULLCONTENT = 2;
     private const uint SWP_NOACTIVATE = 0x0010;
     private const uint SWP_SHOWWINDOW = 0x0040;
-    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-    private static IntPtr cachedVisualHandle = IntPtr.Zero;
-    private static RECT cachedVisualRelative;
-    private static long cachedVisualAt;
-    private static bool hasCachedVisual;
-    private static int cachedVisualWidth, cachedVisualHeight;
+    private const uint SWP_NOOWNERZORDER = 0x0200;
     private static readonly PetAnchorTracker anchorTracker = new PetAnchorTracker();
 
     public static void EnablePerMonitorDpiAwareness()
@@ -752,7 +785,7 @@ public static class NativeWindow
         long style = GetWindowLongPtr(hWnd, GWL_STYLE).ToInt64();
         long exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE).ToInt64();
         if ((style & WS_CAPTION) != 0) return false;
-        if ((exStyle & WS_EX_TOOLWINDOW) == 0 || (exStyle & WS_EX_TOPMOST) == 0 || (exStyle & WS_EX_LAYERED) == 0) return false;
+        if ((exStyle & WS_EX_TOOLWINDOW) == 0 || (exStyle & WS_EX_LAYERED) == 0) return false;
 
         RECT rect;
         if (!GetWindowRect(hWnd, out rect)) return false;
@@ -764,8 +797,8 @@ public static class NativeWindow
         if (dpi == 0) dpi = 96;
         if (!IsSupportedPetSize(width, height, dpi)) return false;
 
-        RECT visualRelative;
-        if (!TryGetPetVisualRelative(hWnd, width, height, out visualRelative))
+        RECT visualRelative, contentRelative, taskRelative;
+        if (!TryGetPetVisualRelative(hWnd, width, height, out visualRelative, out contentRelative, out taskRelative))
         {
             // 新版角色在容器内可自由移动，顶部/中心回退位置并不可靠。
             return false;
@@ -778,6 +811,22 @@ public static class NativeWindow
             Right = rect.Left + visualRelative.Right,
             Bottom = rect.Top + visualRelative.Bottom
         };
+        var contentRect = new RECT
+        {
+            Left = rect.Left + contentRelative.Left,
+            Top = rect.Top + contentRelative.Top,
+            Right = rect.Left + contentRelative.Right,
+            Bottom = rect.Top + contentRelative.Bottom
+        };
+        var taskRect = taskRelative.Right > taskRelative.Left && taskRelative.Bottom > taskRelative.Top
+            ? new RECT
+            {
+                Left = rect.Left + taskRelative.Left,
+                Top = rect.Top + taskRelative.Top,
+                Right = rect.Left + taskRelative.Right,
+                Bottom = rect.Top + taskRelative.Bottom
+            }
+            : new RECT();
 
         IntPtr monitor = MonitorFromRect(ref visualRect, MONITOR_DEFAULTTONEAREST);
         var monitorInfo = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
@@ -788,6 +837,8 @@ public static class NativeWindow
             Handle = hWnd,
             Rect = rect,
             VisualRect = visualRect,
+            ContentRect = contentRect,
+            TaskRect = taskRect,
             WorkArea = monitorInfo.rcWork,
             Dpi = dpi
         };
@@ -796,13 +847,27 @@ public static class NativeWindow
 
     public static bool TryFindPetPixels(byte[] pixels, int width, int height, out RECT visual)
     {
+        RECT content, task;
+        return TryFindPetPixels(pixels, width, height, out visual, out content, out task);
+    }
+
+    public static bool TryFindPetPixels(byte[] pixels, int width, int height, out RECT visual, out RECT content)
+    {
+        RECT task;
+        return TryFindPetPixels(pixels, width, height, out visual, out content, out task);
+    }
+
+    public static bool TryFindPetPixels(byte[] pixels, int width, int height, out RECT visual, out RECT content, out RECT task)
+    {
         visual = new RECT();
+        content = new RECT();
+        task = new RECT();
         if (width <= 0 || height <= 0 || pixels == null || pixels.LongLength < (long)width * height * 4) return false;
         // 角色、按钮和任务卡片之间有透明行；卡片可能翻到角色上方。
         // 排除扁宽卡片与小按钮，在角色形状的像素带中选择最高者。
         // 扫描整窗，不能假定角色始终位于透明容器上方 34%。
         int minX = width, maxX = -1, top = -1, bottom = -1, count = 0;
-        int bestHeight = 0;
+        int bestHeight = 0, bestTaskArea = 0;
         for (int y = 0; y <= height; y++)
         {
             bool occupied = false;
@@ -821,11 +886,28 @@ public static class NativeWindow
             {
                 int bandHeight = bottom - top + 1;
                 int bandWidth = maxX - minX + 1;
+                int padding = Math.Max(2, width / 150);
+                var band = new RECT { Left = Math.Max(0, minX - padding), Top = Math.Max(0, top - padding),
+                    Right = Math.Min(width, maxX + padding + 1), Bottom = Math.Min(height, bottom + padding + 1) };
+                // 角色筛选仍忽略卡片，但避让边界保留所有有效像素带及其实际横向偏移。
+                // 沿用有效像素数量下限，避免孤立噪点把悬浮窗推到远处。
+                if (count >= 100)
+                {
+                    if (content.Right <= content.Left) content = band;
+                    else content = new RECT { Left = Math.Min(content.Left, band.Left), Top = Math.Min(content.Top, band.Top),
+                        Right = Math.Max(content.Right, band.Right), Bottom = Math.Max(content.Bottom, band.Bottom) };
+                }
+                int taskArea = bandWidth * bandHeight;
+                int minimumTaskWidth = Math.Max(80, width / 4);
+                if (count >= 100 && bandHeight >= 18 && bandWidth >= minimumTaskWidth &&
+                    bandWidth >= bandHeight * 2 && taskArea > bestTaskArea)
+                {
+                    task = band;
+                    bestTaskArea = taskArea;
+                }
                 if (count >= 100 && bandHeight >= 40 && bandWidth >= 12 && bandWidth <= bandHeight * 2 && bandHeight > bestHeight)
                 {
-                    int padding = Math.Max(2, width / 150);
-                    visual = new RECT { Left = Math.Max(0, minX - padding), Top = Math.Max(0, top - padding),
-                        Right = Math.Min(width, maxX + padding + 1), Bottom = Math.Min(height, bottom + padding + 1) };
+                    visual = band;
                     bestHeight = bandHeight;
                 }
                 minX = width; maxX = -1; top = -1; bottom = -1; count = 0;
@@ -834,16 +916,12 @@ public static class NativeWindow
         return bestHeight > 0;
     }
 
-    private static bool TryGetPetVisualRelative(IntPtr hWnd, int width, int height, out RECT visual)
+    private static bool TryGetPetVisualRelative(IntPtr hWnd, int width, int height, out RECT visual, out RECT content, out RECT task)
     {
-        long now = Environment.TickCount;
-        if (hasCachedVisual && cachedVisualHandle == hWnd && cachedVisualWidth == width && cachedVisualHeight == height && now - cachedVisualAt >= 0 && now - cachedVisualAt < 250)
-        {
-            visual = cachedVisualRelative;
-            return true;
-        }
-
+        // 调用方已有 250ms 轮询节流；每轮捕获当前卡片布局，避免同尺寸内移时复用旧边界。
         visual = new RECT();
+        content = new RECT();
+        task = new RECT();
         IntPtr windowDc = IntPtr.Zero;
         IntPtr memoryDc = IntPtr.Zero;
         IntPtr bitmap = IntPtr.Zero;
@@ -874,14 +952,7 @@ public static class NativeWindow
             var pixels = new byte[byteCount];
             Marshal.Copy(bits, pixels, 0, byteCount);
 
-            if (!TryFindPetPixels(pixels, width, height, out visual)) { hasCachedVisual = false; return false; }
-            cachedVisualHandle = hWnd;
-            cachedVisualRelative = visual;
-            cachedVisualAt = now;
-            hasCachedVisual = true;
-            cachedVisualWidth = width;
-            cachedVisualHeight = height;
-            return true;
+            return TryFindPetPixels(pixels, width, height, out visual, out content, out task);
         }
         catch { return false; }
         finally
@@ -896,7 +967,7 @@ public static class NativeWindow
     public static void MakeOverlayClickThrough(IntPtr hWnd)
     {
         long exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE).ToInt64();
-        exStyle |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
         SetWindowLongPtr(hWnd, GWL_EXSTYLE, new IntPtr(exStyle));
     }
 
@@ -908,7 +979,36 @@ public static class NativeWindow
         double gapDip,
         double overlayVisualScale)
     {
-        double scale = pet.Dpi / 96.0;
+        PositionOverlay(overlay, pet, widthDip, heightDip, gapDip, overlayVisualScale, OverlayLayout.Vertical);
+    }
+
+    public static PetWindowInfo GetAnchoredPet(PetWindowInfo pet)
+    {
+        POINT cursor;
+        bool cursorAvailable = GetCursorPos(out cursor);
+        RECT stable = anchorTracker.Update(pet, cursorAvailable && (GetAsyncKeyState(1) & 0x8000) != 0, cursor.X, cursor.Y);
+        return new PetWindowInfo { Handle = pet.Handle, Rect = pet.Rect, VisualRect = stable,
+            ContentRect = pet.ContentRect, TaskRect = pet.TaskRect, WorkArea = pet.WorkArea, Dpi = pet.Dpi };
+    }
+
+    public static OverlayLayout GetOverlayLayout(PetWindowInfo pet, int verticalWidth, int verticalHeight, int gap)
+    {
+        RECT vertical = CalculateOverlayRect(pet, verticalWidth, verticalHeight, gap, OverlayLayout.Vertical);
+        return vertical.Right > vertical.Left && vertical.Bottom > vertical.Top
+            ? OverlayLayout.Vertical
+            : OverlayLayout.Horizontal;
+    }
+
+    public static void PositionOverlay(
+        IntPtr overlay,
+        PetWindowInfo pet,
+        double widthDip,
+        double heightDip,
+        double gapDip,
+        double overlayVisualScale,
+        OverlayLayout layout)
+    {
+        double scale = (pet.Dpi == 0 ? 96 : pet.Dpi) / 96.0;
         double overlayScale = overlayVisualScale;
         if (overlayScale <= 0)
         {
@@ -920,27 +1020,103 @@ public static class NativeWindow
         int width = Math.Max(1, (int)Math.Round(widthDip * overlayScale));
         int height = Math.Max(1, (int)Math.Round(heightDip * overlayScale));
         int gap = Math.Max(1, (int)Math.Round(gapDip * scale));
-        POINT cursor;
-        bool cursorAvailable = GetCursorPos(out cursor);
-        RECT stable = anchorTracker.Update(pet, cursorAvailable && (GetAsyncKeyState(1) & 0x8000) != 0, cursor.X, cursor.Y);
-        var anchoredPet = new PetWindowInfo { Handle = pet.Handle, Rect = pet.Rect, VisualRect = stable, WorkArea = pet.WorkArea, Dpi = pet.Dpi };
-        RECT target = CalculateOverlayRect(anchoredPet, width, height, gap);
+        RECT target = CalculateOverlayRect(pet, width, height, gap, layout);
+        if (target.Right <= target.Left || target.Bottom <= target.Top)
+        {
+            // 工作区没有完整的避让位置时临时隐藏，下次采样有空间即恢复。
+            ShowWindow(overlay, 0);
+            return;
+        }
+        // 紧随桌宠实际 Z 序，随其切换置顶分组，不提升桌宠或抢占焦点。
+        if (pet.Handle == IntPtr.Zero || pet.Handle == overlay || !IsWindowVisible(pet.Handle) ||
+            !SetWindowPos(overlay, pet.Handle, target.Left, target.Top, width, height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW))
+        {
+            ShowWindow(overlay, 0);
+        }
+    }
 
-        SetWindowPos(overlay, HWND_TOPMOST, target.Left, target.Top, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    private static RECT UnionRect(RECT a, RECT b)
+    {
+        if (a.Right <= a.Left || a.Bottom <= a.Top) return b;
+        if (b.Right <= b.Left || b.Bottom <= b.Top) return a;
+        return new RECT { Left = Math.Min(a.Left, b.Left), Top = Math.Min(a.Top, b.Top),
+            Right = Math.Max(a.Right, b.Right), Bottom = Math.Max(a.Bottom, b.Bottom) };
     }
 
     public static RECT CalculateOverlayRect(PetWindowInfo pet, int width, int height, int gap)
     {
-        int rightX = pet.VisualRect.Right + gap;
-        int leftX = pet.VisualRect.Left - gap - width;
-        int x;
-        if (rightX + width <= pet.WorkArea.Right) x = rightX;
-        else if (leftX >= pet.WorkArea.Left) x = leftX;
-        else x = Math.Max(pet.WorkArea.Left, Math.Min(rightX, pet.WorkArea.Right - width));
+        return CalculateOverlayRect(pet, width, height, gap, OverlayLayout.Vertical);
+    }
+
+    public static RECT CalculateOverlayRect(PetWindowInfo pet, int width, int height, int gap, OverlayLayout layout)
+    {
+        if (width <= 0 || height <= 0 || width > pet.WorkArea.Right - pet.WorkArea.Left ||
+            height > pet.WorkArea.Bottom - pet.WorkArea.Top) return new RECT();
 
         int visualHeight = pet.VisualRect.Bottom - pet.VisualRect.Top;
         int y = pet.VisualRect.Top + (visualHeight - height) / 2;
-        y = Math.Max(pet.WorkArea.Top, Math.Min(y, pet.WorkArea.Bottom - height));
+        int clearance = Math.Max(1, (int)Math.Round(8 * (pet.Dpi == 0 ? 1 : pet.Dpi / 96.0)));
+        RECT content = pet.ContentRect;
+        RECT task = pet.TaskRect;
+        bool hasTaskCard = task.Right > task.Left && task.Bottom > task.Top;
+        // 使用中心判侧，容忍像素 padding 或稳定角色锚点带来的少量纵向相交。
+        bool taskIsAbove = hasTaskCard &&
+            (long)task.Top + task.Bottom <= (long)pet.VisualRect.Top + pet.VisualRect.Bottom;
+        if (layout == OverlayLayout.Horizontal)
+        {
+            // 竖排没有完整安全位置时才会进入这里。任务卡存在时，横排固定放在
+            // 卡片同侧：上方卡片配上方横排，下方卡片配下方横排。
+            RECT obstacle = UnionRect(UnionRect(content, pet.VisualRect), task);
+            int centeredX = obstacle.Left + (obstacle.Right - obstacle.Left - width) / 2;
+            centeredX = Math.Max(pet.WorkArea.Left, Math.Min(centeredX, pet.WorkArea.Right - width));
+            int aboveY = obstacle.Top - clearance - height;
+            int belowY = obstacle.Bottom + clearance;
+            bool aboveFits = aboveY >= pet.WorkArea.Top && aboveY + height <= pet.WorkArea.Bottom;
+            bool belowFits = belowY >= pet.WorkArea.Top && belowY + height <= pet.WorkArea.Bottom;
+            if (hasTaskCard)
+            {
+                if (taskIsAbove)
+                {
+                    if (!aboveFits) return new RECT();
+                    y = aboveY;
+                }
+                else
+                {
+                    if (!belowFits) return new RECT();
+                    y = belowY;
+                }
+            }
+            else
+            {
+                if (!aboveFits && !belowFits) return new RECT();
+                // 无任务卡时，下方能完整容纳便优先放下方，否则对称地尝试上方。
+                y = belowFits ? belowY : aboveY;
+            }
+            return new RECT { Left = centeredX, Top = y, Right = centeredX + width, Bottom = y + height };
+        }
+
+        // 常态贴近角色左右放置。任务卡出现后仍保持横坐标，但竖排只能放到卡片反侧：
+        // 上方卡片配下方竖排，下方卡片配上方竖排，避免形成同方向的长纵列。
+        int rightX = pet.VisualRect.Right + gap;
+        int leftX = pet.VisualRect.Left - gap - width;
+        int x;
+        if (rightX >= pet.WorkArea.Left && rightX + width <= pet.WorkArea.Right) x = rightX;
+        else if (leftX >= pet.WorkArea.Left && leftX + width <= pet.WorkArea.Right) x = leftX;
+        else return new RECT(); // 两侧都放不下时切换横排，禁止钳位后覆盖角色。
+
+        if (hasTaskCard)
+        {
+            // 只按任务卡边缘做最小位移；ContentRect 含角色和按钮，按它避让会
+            // 把整个竖排推到角色上/下方。保留卡片反侧规则及角色旁的横坐标。
+            y = taskIsAbove ? Math.Max(y, task.Bottom + clearance)
+                : Math.Min(y, task.Top - clearance - height);
+        }
+        if (y < pet.WorkArea.Top || y + height > pet.WorkArea.Bottom)
+        {
+            // 不钳位纵坐标或退回卡片同侧；自然/最小避让位置放不下才切换横排。
+            return new RECT();
+        }
         return new RECT { Left = x, Top = y, Right = x + width, Bottom = y + height };
     }
 
@@ -948,7 +1124,10 @@ public static class NativeWindow
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int X, Y; }
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int command);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
@@ -1002,6 +1181,8 @@ if ($PositionSelfTest) {
     [void]$tracker.Update($tracked, $true, 2000, 2000)
     $anchor = $tracker.Update($tracked, $true, 2200, 2100)
     Assert-Equal -Name '其他窗口鼠标操作不移动锚点' -Actual $anchor.Left -Expected 200
+    $anchor = $tracker.Update($tracked, $true, 230, 500)
+    Assert-Equal -Name '从其他窗口按住经过角色不解锁锚点' -Actual $anchor.Top -Expected 400
     [void]$tracker.Update($tracked, $false, 2200, 2100)
     $container = [NativeWindow+RECT]::new(); $container.Left = 50; $container.Right = 850
     $frame.Left += 50; $frame.Right += 50; $tracked.Rect = $container; $tracked.VisualRect = $frame
@@ -1033,9 +1214,27 @@ if ($PositionSelfTest) {
             for ($x = 20; $x -lt 180; $x++) { $pixels[($y * 200 + $x) * 4] = 255 }
         }
         $bounds = [NativeWindow+RECT]::new()
-        Assert-Equal -Name "识别整窗 y=$petY 角色" -Actual ([NativeWindow]::TryFindPetPixels($pixels, 200, 600, [ref]$bounds)) -Expected $true
+        $contentBounds = [NativeWindow+RECT]::new()
+        $taskBounds = [NativeWindow+RECT]::new()
+        Assert-Equal -Name "识别整窗 y=$petY 角色" -Actual ([NativeWindow]::TryFindPetPixels($pixels, 200, 600, [ref]$bounds, [ref]$contentBounds, [ref]$taskBounds)) -Expected $true
         Assert-Equal -Name "跟随 y=$petY 而非通知卡片" -Actual $bounds.Top -Expected ($petY - 2)
         Assert-Equal -Name "角色下边界 y=$petY" -Actual $bounds.Bottom -Expected ($petY + 102)
+        Assert-Equal -Name "内容包含 y=$petY 下方任务卡片" -Actual $contentBounds.Bottom -Expected 592
+        Assert-Equal -Name "内容包含 y=$petY 偏移卡片左缘" -Actual $contentBounds.Left -Expected $(if ($petY -gt 200) { 8 } else { 18 })
+        Assert-Equal -Name "内容包含 y=$petY 偏移卡片右缘" -Actual $contentBounds.Right -Expected $(if ($petY -gt 200) { 192 } else { 182 })
+        Assert-Equal -Name "内容忽略 y=$petY 顶部孤立噪点" -Actual $contentBounds.Top -Expected $(if ($petY -gt 200) { 98 } else { $petY - 2 })
+        Assert-Equal -Name "单独识别 y=$petY 任务卡片上缘" -Actual $taskBounds.Top -Expected $(if ($petY -gt 200) { 98 } else { 548 })
+        Assert-Equal -Name "单独识别 y=$petY 任务卡片下缘" -Actual $taskBounds.Bottom -Expected $(if ($petY -gt 200) { 147 } else { 592 })
+        Assert-Equal -Name "单独识别 y=$petY 任务卡片左缘" -Actual $taskBounds.Left -Expected $(if ($petY -gt 200) { 8 } else { 18 })
+        Assert-Equal -Name "单独识别 y=$petY 任务卡片右缘" -Actual $taskBounds.Right -Expected $(if ($petY -gt 200) { 192 } else { 182 })
+        # 同一尺寸的新帧中卡片消失，避让边界应同步缩回角色而非保留旧值。
+        [Array]::Clear($pixels, 0, $pixels.Length)
+        for ($y = $petY; $y -lt $petY + 100; $y++) {
+            for ($x = 80; $x -lt 140; $x++) { $pixels[($y * 200 + $x) * 4] = 255 }
+        }
+        Assert-Equal -Name "卡片消失后 y=$petY 角色仍可见" -Actual ([NativeWindow]::TryFindPetPixels($pixels, 200, 600, [ref]$bounds, [ref]$contentBounds, [ref]$taskBounds)) -Expected $true
+        Assert-Equal -Name "卡片消失后 y=$petY 清除旧内容边界" -Actual $contentBounds.Equals($bounds) -Expected $true
+        Assert-Equal -Name "卡片消失后 y=$petY 清除任务卡片边界" -Actual $taskBounds.Equals([NativeWindow+RECT]::new()) -Expected $true
     }
     $emptyBounds = [NativeWindow+RECT]::new()
     Assert-Equal -Name '空窗不生成猜测锚点' -Actual ([NativeWindow]::TryFindPetPixels((New-Object byte[] 1600), 20, 20, [ref]$emptyBounds)) -Expected $false
@@ -1064,17 +1263,23 @@ if ($PositionSelfTest) {
     foreach ($scale in @(1.0, 1.25, 1.5, 2.0)) {
         $width = [int]($script:PanelWidthDip * $scale)
         $height = [int]($script:PanelHeightDip * $scale)
+        $horizontalWidth = [int]($script:HorizontalPanelWidthDip * $scale)
+        $horizontalHeight = [int]($script:HorizontalPanelHeightDip * $scale)
         $visual.Left = 740; $visual.Right = 780; $visual.Top = 520; $visual.Bottom = 590
-        $pet.VisualRect = $visual
+        $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
         $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, 4)
-        Assert-Equal "双球 $scale 缩放不重叠角色" ($rect.Right -le ($visual.Left - 4)) $true
-        Assert-Equal "双球 $scale 缩放限制底部" ($rect.Bottom -le $work.Bottom) $true
-        Assert-Equal "双球 $scale 缩放高度" ($rect.Bottom - $rect.Top) $height
-        $visual.Top = 0; $visual.Bottom = 60; $pet.VisualRect = $visual
+        Assert-Equal "双球 $scale 缩放底部竖排空间不足" $rect.Equals([NativeWindow+RECT]::new()) $true
+        Assert-Equal "双球 $scale 缩放底部切为横排" ([NativeWindow]::GetOverlayLayout($pet, $width, $height, 4)) ([OverlayLayout]::Horizontal)
+        $horizontalRect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, 4, [OverlayLayout]::Horizontal)
+        Assert-Equal "双球 $scale 缩放底部横排放在上方" $horizontalRect.Bottom ($visual.Top - 8)
+        $visual.Top = 0; $visual.Bottom = 60; $pet.VisualRect = $visual; $pet.ContentRect = $visual
         $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, 4)
-        Assert-Equal "双球 $scale 缩放限制顶部" $rect.Top 0
+        Assert-Equal "双球 $scale 缩放顶部竖排空间不足" $rect.Equals([NativeWindow+RECT]::new()) $true
+        Assert-Equal "双球 $scale 缩放顶部切为横排" ([NativeWindow]::GetOverlayLayout($pet, $width, $height, 4)) ([OverlayLayout]::Horizontal)
+        $horizontalRect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, 4, [OverlayLayout]::Horizontal)
+        Assert-Equal "双球 $scale 缩放顶部横排放在下方" $horizontalRect.Top ($visual.Bottom + 8)
     }
-    # 使用实际配置验证横向留白；保留上面的 4px 用例覆盖底层定位函数。
+    # 使用实际配置验证常态贴近角色；保留上面的 4px 用例覆盖底层定位函数。
     foreach ($scale in @(1.0, 1.25, 1.5, 2.0)) {
         $width = [int][math]::Round($script:PanelWidthDip * $scale)
         $height = [int][math]::Round($script:PanelHeightDip * $scale)
@@ -1083,30 +1288,359 @@ if ($PositionSelfTest) {
         $work.Right = [int](1200 * $scale); $work.Bottom = [int](800 * $scale)
         $visual.Left = [int](500 * $scale); $visual.Right = [int](560 * $scale)
         $visual.Top = [int](350 * $scale); $visual.Bottom = [int](450 * $scale)
-        $pet.VisualRect = $visual; $pet.WorkArea = $work
+        $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new(); $pet.WorkArea = $work
         $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
-        Assert-Equal "任务卡片 $scale 缩放右侧间距" $rect.Left ($visual.Right + $gap)
-        # 回归场景：任务卡片右缘比角色右缘宽 75 DIP，仍需至少 8 DIP 留白。
-        $cardRight = $visual.Right + [int][math]::Round(75 * $scale)
-        Assert-Equal "任务卡片 $scale 缩放文字安全间距" (($rect.Left - $cardRight) -ge [int][math]::Round(8 * $scale)) $true
-        Assert-Equal "任务卡片 $scale 缩放纵向锚点不变" $rect.Top ($visual.Top + [int][math]::Truncate(($visual.Bottom - $visual.Top - $height) / 2.0))
+        Assert-Equal "常态 $scale 缩放贴近角色右侧" $rect.Left ($visual.Right + $gap)
+        Assert-Equal "常态 $scale 缩放间距不超过 8 DIP" ($rect.Left - $visual.Right) $gap
+        Assert-Equal "常态 $scale 缩放纵向居中" $rect.Top ($visual.Top + [int][math]::Truncate(($visual.Bottom - $visual.Top - $height) / 2.0))
 
         $visual.Right = $work.Right - [int](20 * $scale)
         $visual.Left = $visual.Right - [int](60 * $scale)
-        $pet.VisualRect = $visual
+        $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
         $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
-        Assert-Equal "任务卡片 $scale 缩放左翻间距" $rect.Right ($visual.Left - $gap)
-        $cardLeft = $visual.Left - [int][math]::Round(75 * $scale)
-        Assert-Equal "任务卡片 $scale 缩放左侧文字安全间距" (($cardLeft - $rect.Right) -ge [int][math]::Round(8 * $scale)) $true
-        Assert-Equal "任务卡片 $scale 缩放左翻位于工作区" ($rect.Left -ge $work.Left -and $rect.Right -le $work.Right) $true
+        Assert-Equal "常态 $scale 缩放右侧不足时贴近左侧" $rect.Right ($visual.Left - $gap)
+        Assert-Equal "常态 $scale 缩放左翻位于工作区" ($rect.Left -ge $work.Left -and $rect.Right -le $work.Right) $true
 
-        # 两侧均不足时仍限制屏幕边界，不把额外偏移加到最终坐标上。
-        $work.Right = [int](260 * $scale); $work.Bottom = [int](600 * $scale)
-        $visual.Left = [int](110 * $scale); $visual.Right = [int](170 * $scale)
-        $pet.VisualRect = $visual; $pet.WorkArea = $work
+        # 两侧均不足时拒绝竖排，禁止横坐标钳位后压住角色。
+        $work.Right = [int](180 * $scale); $work.Bottom = [int](600 * $scale)
+        $visual.Left = [int](70 * $scale); $visual.Right = [int](110 * $scale)
+        $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new(); $pet.WorkArea = $work
         $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
-        Assert-Equal "任务卡片 $scale 缩放窄屏横向约束" ($rect.Left -ge $work.Left -and $rect.Right -le $work.Right) $true
+        Assert-Equal "常态 $scale 缩放窄屏不覆盖角色" $rect.Equals([NativeWindow+RECT]::new()) $true
     }
+    # 任务卡片出现后保持角色旁的横坐标，通过上下移动避让；卡片贴边平移或变宽不再横推面板。
+    foreach ($scale in @(1.0, 1.25, 1.5, 2.0)) {
+        $width = [int][math]::Round($script:PanelWidthDip * $scale)
+        $height = [int][math]::Round($script:PanelHeightDip * $scale)
+        $gap = [int][math]::Round($script:PanelGapDip * $scale)
+        $clearance = [int][math]::Round(8 * $scale)
+        $pet.Dpi = [uint32](96 * $scale)
+        foreach ($originX in @(0, -1200)) {
+            $work.Left = [int]($originX * $scale); $work.Top = [int](-100 * $scale)
+            $work.Right = $work.Left + [int](1200 * $scale); $work.Bottom = [int](700 * $scale)
+            $pet.WorkArea = $work
+            $visual.Top = [int](250 * $scale); $visual.Bottom = [int](350 * $scale)
+            $content = [NativeWindow+RECT]::new()
+            $content.Top = $visual.Top; $content.Bottom = [int](410 * $scale)
+            foreach ($edge in @('Left', 'Right')) {
+                if ($edge -eq 'Left') {
+                    $visual.Left = $work.Left + [int](8 * $scale); $visual.Right = $work.Left + [int](68 * $scale)
+                    $content.Left = $visual.Left; $content.Right = $work.Left + [int](228 * $scale)
+                }
+                else {
+                    $visual.Left = $work.Right - [int](68 * $scale); $visual.Right = $work.Right - [int](8 * $scale)
+                    $content.Left = $work.Right - [int](228 * $scale); $content.Right = $visual.Right
+                }
+                $task = [NativeWindow+RECT]@{
+                    Left=$content.Left; Top=$visual.Bottom+[int](10*$scale)
+                    Right=$content.Right; Bottom=$content.Bottom
+                }
+                $pet.VisualRect = $visual; $pet.ContentRect = $content; $pet.TaskRect = $task
+                $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+                $expectedX = if ($edge -eq 'Left') { $visual.Right + $gap } else { $visual.Left - $gap - $width }
+                Assert-Equal "贴 $edge 边 $scale 缩放 origin=$originX 不横向远离" $rect.Left $expectedX
+                Assert-Equal "贴 $edge 边 $scale 缩放 origin=$originX 下方卡片向上避让" $rect.Bottom ($task.Top - $clearance)
+                Assert-Equal "贴 $edge 边 $scale 缩放 origin=$originX 完整位于工作区" ($rect.Left -ge $work.Left -and $rect.Right -le $work.Right -and $rect.Top -ge $work.Top -and $rect.Bottom -le $work.Bottom) $true
+
+                # 卡片翻到角色上方时，只移到卡片下缘，不移到角色下方。
+                $content.Top = $visual.Top - [int](60 * $scale); $content.Bottom = $visual.Bottom
+                $task.Top = $content.Top; $task.Bottom = $visual.Top - [int](10 * $scale)
+                $pet.ContentRect = $content; $pet.TaskRect = $task
+                $aboveRect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+                Assert-Equal "贴 $edge 边 $scale 缩放上方卡片向下避让" $aboveRect.Top ($task.Bottom + $clearance)
+                Assert-Equal "贴 $edge 边 $scale 缩放上下避让保持横坐标" $aboveRect.Left $expectedX
+
+                # 角色不移动，仅卡片横向继续变宽，不应改变面板横坐标或纵向避让位置。
+                $widerContent = $content
+                $widerTask = $task
+                if ($edge -eq 'Left') {
+                    $widerContent.Right += [int](40 * $scale); $widerTask.Right += [int](40 * $scale)
+                }
+                else {
+                    $widerContent.Left -= [int](40 * $scale); $widerTask.Left -= [int](40 * $scale)
+                }
+                $pet.ContentRect = $widerContent; $pet.TaskRect = $widerTask
+                $widerRect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+                Assert-Equal "贴 $edge 边 $scale 缩放卡片变宽不横推" $widerRect.Left $expectedX
+                Assert-Equal "贴 $edge 边 $scale 缩放卡片变宽保持上下位置" $widerRect.Top $aboveRect.Top
+
+                $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
+                $clearedRect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+                Assert-Equal "贴 $edge 边 $scale 缩放卡片消失恢复常态横坐标" $clearedRect.Left $expectedX
+                Assert-Equal "贴 $edge 边 $scale 缩放卡片消失恢复纵向居中" $clearedRect.Top ($visual.Top + [int][math]::Truncate(($visual.Bottom - $visual.Top - $height) / 2.0))
+
+                # 还原到下方卡片，供下一轮边缘用例使用。
+                $content.Top = $visual.Top; $content.Bottom = [int](410 * $scale)
+                $task.Top = $visual.Bottom + [int](10 * $scale); $task.Bottom = $content.Bottom
+            }
+        }
+
+        # 对侧竖排放不下时切为卡片同侧横排，不能退回卡片同侧的长竖排。
+        $horizontalWidth = [int][math]::Round($script:HorizontalPanelWidthDip * $scale)
+        $horizontalHeight = [int][math]::Round($script:HorizontalPanelHeightDip * $scale)
+        $work.Left = 0; $work.Top = 0; $work.Right = [int](600 * $scale); $work.Bottom = [int](800 * $scale)
+        $visual.Left = [int](250 * $scale); $visual.Right = [int](310 * $scale)
+        $visual.Top = [int](40 * $scale); $visual.Bottom = [int](140 * $scale)
+        $content.Left = [int](120 * $scale); $content.Right = [int](440 * $scale)
+        $content.Top = $visual.Top; $content.Bottom = [int](200 * $scale)
+        $task = [NativeWindow+RECT]@{
+            Left=$content.Left; Top=[int](150*$scale); Right=$content.Right; Bottom=$content.Bottom
+        }
+        $pet.VisualRect = $visual; $pet.ContentRect = $content; $pet.TaskRect = $task; $pet.WorkArea = $work
+        $verticalRect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+        Assert-Equal "下方卡片的上方竖排不足时拒绝同侧竖排" $verticalRect.Equals([NativeWindow+RECT]::new()) $true
+        $layout = [NativeWindow]::GetOverlayLayout($pet, $width, $height, $gap)
+        Assert-Equal "下方卡片的对侧竖排不足时切横排" $layout ([OverlayLayout]::Horizontal)
+        $rect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $layout)
+        Assert-Equal "下方卡片切换后横排仍在下方" $rect.Top ($content.Bottom + $clearance)
+
+        $visual.Top = [int](660 * $scale); $visual.Bottom = [int](760 * $scale)
+        $content.Top = [int](600 * $scale); $content.Bottom = $visual.Bottom
+        $task.Top = $content.Top; $task.Bottom = [int](650 * $scale)
+        $pet.VisualRect = $visual; $pet.ContentRect = $content; $pet.TaskRect = $task
+        $verticalRect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+        Assert-Equal "上方卡片的下方竖排不足时拒绝同侧竖排" $verticalRect.Equals([NativeWindow+RECT]::new()) $true
+        $layout = [NativeWindow]::GetOverlayLayout($pet, $width, $height, $gap)
+        Assert-Equal "上方卡片的对侧竖排不足时切横排" $layout ([OverlayLayout]::Horizontal)
+        $rect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $layout)
+        Assert-Equal "上方卡片切换后横排仍在上方" $rect.Bottom ($task.Top - $clearance)
+
+        # 桌宠位于屏幕下侧时，Codex 会把任务卡片翻到角色上方；下方竖排能放下时仍沿用左翻规则。
+        # TaskRect 使用真实的独立卡片边界，不把角色本身并入卡片。
+        $visual.Left = [int](520 * $scale); $visual.Right = [int](580 * $scale)
+        $visual.Top = [int](400 * $scale); $visual.Bottom = [int](500 * $scale)
+        $task = [NativeWindow+RECT]@{
+            Left=[int](260*$scale); Top=[int](300*$scale)
+            Right=[int](580*$scale); Bottom=[int](360*$scale)
+        }
+        $pet.VisualRect = $visual; $pet.ContentRect = [NativeWindow+RECT]@{
+            Left=$task.Left; Top=$task.Top; Right=$visual.Right; Bottom=$visual.Bottom
+        }; $pet.TaskRect = $task
+        $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+        Assert-Equal "屏幕下侧卡片在角色上方时右侧不足仍翻到左侧" $rect.Right ($visual.Left - $gap)
+        Assert-Equal "屏幕下侧卡片在角色上方时竖排贴近卡片下缘" $rect.Top ($task.Bottom + $clearance)
+        Assert-Equal "屏幕下侧上方卡片避让后完整位于工作区" ($rect.Left -ge $work.Left -and $rect.Right -le $work.Right -and $rect.Top -ge $work.Top -and $rect.Bottom -le $work.Bottom) $true
+
+        $visual.Top = [int](650 * $scale); $visual.Bottom = [int](750 * $scale)
+        $task.Top = [int](40 * $scale); $task.Bottom = [int](100 * $scale)
+        $pet.VisualRect = $visual; $pet.ContentRect = [NativeWindow+RECT]@{
+            Left=$task.Left; Top=$task.Top; Right=$visual.Right; Bottom=$visual.Bottom
+        }; $pet.TaskRect = $task
+        Assert-Equal "允许的对侧竖排无空间时返回横排布局" ([NativeWindow]::GetOverlayLayout($pet, $width, $height, $gap)) ([OverlayLayout]::Horizontal)
+        $rect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, [OverlayLayout]::Horizontal)
+        Assert-Equal "卡片同侧横排也无空间时返回隐藏标记" $rect.Equals([NativeWindow+RECT]::new()) $true
+        $visual.Top = [int](350 * $scale); $visual.Bottom = [int](450 * $scale)
+        $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
+        $rect = [NativeWindow]::CalculateOverlayRect($pet, $width, $height, $gap)
+        Assert-Equal "卡片消失后恢复显示" (($rect.Right - $rect.Left) -eq $width) $true
+    }
+    # 横竖布局只由当前帧是否存在完整竖排位置决定；上下侧使用同一套镜像规则。
+    foreach ($scale in @(1.0, 1.25, 1.5, 2.0)) {
+        $pet.Dpi = [uint32](96 * $scale)
+        $verticalWidth = [int][math]::Round($script:PanelWidthDip * $scale)
+        $verticalHeight = [int][math]::Round($script:PanelHeightDip * $scale)
+        $horizontalWidth = [int][math]::Round($script:HorizontalPanelWidthDip * $scale)
+        $horizontalHeight = [int][math]::Round($script:HorizontalPanelHeightDip * $scale)
+        $gap = [int][math]::Round($script:PanelGapDip * $scale)
+        $clearance = [int][math]::Round(8 * $scale)
+        foreach ($originX in @(0, -1200)) {
+            $work = [NativeWindow+RECT]@{
+                Left=[int]($originX*$scale); Top=[int](-100*$scale)
+                Right=[int](($originX+1200)*$scale); Bottom=[int](700*$scale)
+            }
+            $pet.WorkArea = $work
+            $visualWidth = [int][math]::Round(60*$scale)
+            $visualHeight = [int][math]::Round(100*$scale)
+            $visual.Left = $work.Left + [int][math]::Round(500*$scale)
+            $visual.Right = $visual.Left + $visualWidth
+
+            # 原 35% 分界附近仍有完整竖排空间，不能提前横排；上、下位置严格镜像。
+            foreach ($ratio in @(0.35, 0.65)) {
+                $centerY = $work.Top + [int][math]::Round(($work.Bottom-$work.Top)*$ratio)
+                $visual.Top = $centerY - [int][math]::Truncate($visualHeight/2.0)
+                $visual.Bottom = $visual.Top + $visualHeight
+                $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
+                $layout = [NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)
+                Assert-Equal "工作区 $ratio 位置 $scale origin=$originX 有空间保持竖排" $layout ([OverlayLayout]::Vertical)
+                $verticalRect = [NativeWindow]::CalculateOverlayRect($pet, $verticalWidth, $verticalHeight, $gap, $layout)
+                Assert-Equal "工作区 $ratio 位置 $scale origin=$originX 竖排完整" ($verticalRect.Top -ge $work.Top -and $verticalRect.Bottom -le $work.Bottom) $true
+            }
+
+            # 靠顶时竖排自然居中位置越界，改用下方横排。
+            $visual.Top = $work.Top + [int][math]::Round(8*$scale)
+            $visual.Bottom = $visual.Top + $visualHeight
+            $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
+            $topLayout = [NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)
+            Assert-Equal "顶部竖排空间不足 $scale origin=$originX 才切横排" $topLayout ([OverlayLayout]::Horizontal)
+            $topRect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $topLayout)
+            Assert-Equal "顶部横排 $scale origin=$originX 放在内容下方" $topRect.Top ($visual.Bottom + $clearance)
+            Assert-Equal "顶部横排 $scale origin=$originX 尺寸完整" (($topRect.Right-$topRect.Left) -eq $horizontalWidth -and ($topRect.Bottom-$topRect.Top) -eq $horizontalHeight) $true
+
+            # 靠底使用完全镜像的触发条件和上方横排位置。
+            $visual.Bottom = $work.Bottom - [int][math]::Round(8*$scale)
+            $visual.Top = $visual.Bottom - $visualHeight
+            $pet.VisualRect = $visual; $pet.ContentRect = $visual
+            $bottomLayout = [NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)
+            Assert-Equal "底部竖排空间不足 $scale origin=$originX 才切横排" $bottomLayout ([OverlayLayout]::Horizontal)
+            $bottomRect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $bottomLayout)
+            Assert-Equal "底部横排 $scale origin=$originX 放在内容上方" $bottomRect.Bottom ($visual.Top - $clearance)
+            Assert-Equal "上下横排 $scale origin=$originX 与边界距离对称" ($topRect.Top-$work.Top) ($work.Bottom-$bottomRect.Bottom)
+
+            # 下方任务卡的对侧竖排不足时，只能切为同侧横排。
+            $visual.Top = $work.Top + [int][math]::Round(80*$scale)
+            $visual.Bottom = $visual.Top + $visualHeight
+            $belowTask = [NativeWindow+RECT]@{
+                Left=$visual.Left-[int][math]::Round(130*$scale); Top=$visual.Bottom+[int][math]::Round(10*$scale)
+                Right=$visual.Right+[int][math]::Round(130*$scale); Bottom=$visual.Bottom+[int][math]::Round(70*$scale)
+            }
+            $belowContent = [NativeWindow+RECT]@{
+                Left=$belowTask.Left; Top=$visual.Top; Right=$belowTask.Right; Bottom=$belowTask.Bottom
+            }
+            $pet.VisualRect = $visual; $pet.ContentRect = $belowContent; $pet.TaskRect = $belowTask
+            Assert-Equal "下方任务卡 $scale origin=$originX 禁止同侧竖排" ([NativeWindow]::CalculateOverlayRect($pet, $verticalWidth, $verticalHeight, $gap).Equals([NativeWindow+RECT]::new())) $true
+            $layout = [NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)
+            Assert-Equal "下方任务卡 $scale origin=$originX 切换横排" $layout ([OverlayLayout]::Horizontal)
+            $belowHorizontal = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $layout)
+            Assert-Equal "下方任务卡 $scale origin=$originX 横排保持下方" $belowHorizontal.Top ($belowContent.Bottom + $clearance)
+
+            # 上方任务卡使用镜像规则：下方竖排不足时，横排保持在上方。
+            $visual.Bottom = $work.Bottom - [int][math]::Round(80*$scale)
+            $visual.Top = $visual.Bottom - $visualHeight
+            $aboveTask = [NativeWindow+RECT]@{
+                Left=$visual.Left-[int][math]::Round(130*$scale); Top=$visual.Top-[int][math]::Round(70*$scale)
+                Right=$visual.Right+[int][math]::Round(130*$scale); Bottom=$visual.Top-[int][math]::Round(10*$scale)
+            }
+            $aboveContent = [NativeWindow+RECT]@{
+                Left=$aboveTask.Left; Top=$aboveTask.Top; Right=$aboveTask.Right; Bottom=$visual.Bottom
+            }
+            $pet.VisualRect = $visual; $pet.ContentRect = $aboveContent; $pet.TaskRect = $aboveTask
+            Assert-Equal "上方任务卡 $scale origin=$originX 禁止同侧竖排" ([NativeWindow]::CalculateOverlayRect($pet, $verticalWidth, $verticalHeight, $gap).Equals([NativeWindow+RECT]::new())) $true
+            $layout = [NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)
+            Assert-Equal "上方任务卡 $scale origin=$originX 切换横排" $layout ([OverlayLayout]::Horizontal)
+            $aboveHorizontal = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, $layout)
+            Assert-Equal "上方任务卡 $scale origin=$originX 横排保持上方" $aboveHorizontal.Bottom ($aboveContent.Top - $clearance)
+
+            # 允许的竖排与横排同侧都没有完整空间时返回空矩形。
+            $visual.Top = $work.Bottom - [int][math]::Round(120*$scale)
+            $visual.Bottom = $work.Bottom - [int][math]::Round(20*$scale)
+            $blockedTask = [NativeWindow+RECT]@{
+                Left=$visual.Left-[int][math]::Round(130*$scale); Top=$work.Top+[int][math]::Round(20*$scale)
+                Right=$visual.Right+[int][math]::Round(130*$scale); Bottom=$work.Top+[int][math]::Round(80*$scale)
+            }
+            $pet.VisualRect = $visual; $pet.ContentRect = [NativeWindow+RECT]@{
+                Left=$blockedTask.Left; Top=$blockedTask.Top; Right=$blockedTask.Right; Bottom=$visual.Bottom
+            }; $pet.TaskRect = $blockedTask
+            Assert-Equal "卡片配对方向都不足 $scale origin=$originX 返回横排布局" ([NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)) ([OverlayLayout]::Horizontal)
+            $blockedRect = [NativeWindow]::CalculateOverlayRect($pet, $horizontalWidth, $horizontalHeight, $gap, [OverlayLayout]::Horizontal)
+            Assert-Equal "卡片配对横排也不足 $scale origin=$originX 返回隐藏标记" $blockedRect.Equals([NativeWindow+RECT]::new()) $true
+
+            # 清除卡片后当前帧立即恢复常态竖排。
+            $visual.Top = $work.Top + [int][math]::Round(350*$scale)
+            $visual.Bottom = $visual.Top + $visualHeight
+            $pet.VisualRect = $visual; $pet.ContentRect = $visual; $pet.TaskRect = [NativeWindow+RECT]::new()
+            Assert-Equal "卡片消失 $scale origin=$originX 当前帧恢复竖排" ([NativeWindow]::GetOverlayLayout($pet, $verticalWidth, $verticalHeight, $gap)) ([OverlayLayout]::Vertical)
+        }
+    }
+
+    # 实机追踪位置约在工作区 64.6% 高度，竖排完整可见，不能再由固定百分比阈值误切横排。
+    $tracePet = [PetWindowInfo]::new()
+    $tracePet.Handle = [IntPtr]999; $tracePet.Dpi = 120
+    $tracePet.WorkArea = [NativeWindow+RECT]@{ Left=2560; Top=511; Right=4480; Bottom=1543 }
+    $tracePet.VisualRect = [NativeWindow+RECT]@{ Left=2934; Top=1115; Right=3066; Bottom=1235 }
+    $tracePet.ContentRect = $tracePet.VisualRect; $tracePet.TaskRect = [NativeWindow+RECT]::new()
+    $traceVerticalWidth = [int][math]::Round($script:PanelWidthDip*1.25)
+    $traceVerticalHeight = [int][math]::Round($script:PanelHeightDip*1.25)
+    Assert-Equal '实机 64.6% 高度仍有完整空间时保持竖排' ([NativeWindow]::GetOverlayLayout($tracePet, $traceVerticalWidth, $traceVerticalHeight, 10)) ([OverlayLayout]::Vertical)
+
+    # 用户截图回归：卡片和竖排额度 UI 不得继续堆在同一方向。
+    $screenshotPet = [PetWindowInfo]::new()
+    $screenshotPet.Dpi = 96
+    $screenshotPet.WorkArea = [NativeWindow+RECT]@{ Left=0; Top=0; Right=335; Bottom=574 }
+    $screenshotPet.VisualRect = [NativeWindow+RECT]@{ Left=106; Top=50; Right=153; Bottom=140 }
+    $screenshotPet.TaskRect = [NativeWindow+RECT]@{ Left=36; Top=190; Right=235; Bottom=243 }
+    $screenshotPet.ContentRect = [NativeWindow+RECT]@{ Left=36; Top=50; Right=235; Bottom=243 }
+    $screenshotLayout = [NativeWindow]::GetOverlayLayout($screenshotPet, 96, 232, 8)
+    Assert-Equal '截图回归：下方卡片拒绝同侧竖排' $screenshotLayout ([OverlayLayout]::Horizontal)
+    $screenshotRect = [NativeWindow]::CalculateOverlayRect($screenshotPet, 192, 116, 8, $screenshotLayout)
+    Assert-Equal '截图回归：下方卡片改用下方横排' $screenshotRect.Top 251
+
+    $screenshotPet.WorkArea = [NativeWindow+RECT]@{ Left=0; Top=0; Right=335; Bottom=604 }
+    $screenshotPet.VisualRect = [NativeWindow+RECT]@{ Left=106; Top=425; Right=153; Bottom=535 }
+    $screenshotPet.TaskRect = [NativeWindow+RECT]@{ Left=36; Top=354; Right=235; Bottom=414 }
+    $screenshotPet.ContentRect = [NativeWindow+RECT]@{ Left=36; Top=354; Right=235; Bottom=560 }
+    $screenshotLayout = [NativeWindow]::GetOverlayLayout($screenshotPet, 96, 232, 8)
+    Assert-Equal '截图回归：上方卡片拒绝同侧竖排' $screenshotLayout ([OverlayLayout]::Horizontal)
+    $screenshotRect = [NativeWindow]::CalculateOverlayRect($screenshotPet, 192, 116, 8, $screenshotLayout)
+    Assert-Equal '截图回归：上方卡片改用上方横排' $screenshotRect.Bottom 346
+
+    # 稳定角色锚点与当帧任务卡轻微相交时，仍须保持同一配对规则。
+    $screenshotPet.WorkArea = [NativeWindow+RECT]@{ Left=0; Top=0; Right=335; Bottom=574 }
+    $screenshotPet.VisualRect = [NativeWindow+RECT]@{ Left=106; Top=50; Right=153; Bottom=140 }
+    $screenshotPet.TaskRect = [NativeWindow+RECT]@{ Left=36; Top=130; Right=235; Bottom=200 }
+    $screenshotPet.ContentRect = [NativeWindow+RECT]@{ Left=36; Top=50; Right=235; Bottom=200 }
+    $overlapLayout = [NativeWindow]::GetOverlayLayout($screenshotPet, 96, 232, 8)
+    Assert-Equal '锚点相交回归：下方卡片仍拒绝同侧竖排' $overlapLayout ([OverlayLayout]::Horizontal)
+    $overlapRect = [NativeWindow]::CalculateOverlayRect($screenshotPet, 192, 116, 8, $overlapLayout)
+    Assert-Equal '锚点相交回归：下方卡片仍使用下方横排' $overlapRect.Top 208
+
+    $screenshotPet.WorkArea = [NativeWindow+RECT]@{ Left=0; Top=0; Right=335; Bottom=604 }
+    $screenshotPet.VisualRect = [NativeWindow+RECT]@{ Left=106; Top=425; Right=153; Bottom=535 }
+    $screenshotPet.TaskRect = [NativeWindow+RECT]@{ Left=36; Top=354; Right=235; Bottom=435 }
+    $screenshotPet.ContentRect = [NativeWindow+RECT]@{ Left=36; Top=354; Right=235; Bottom=560 }
+    $overlapLayout = [NativeWindow]::GetOverlayLayout($screenshotPet, 96, 232, 8)
+    Assert-Equal '锚点相交回归：上方卡片仍拒绝同侧竖排' $overlapLayout ([OverlayLayout]::Horizontal)
+    $overlapRect = [NativeWindow]::CalculateOverlayRect($screenshotPet, 192, 116, 8, $overlapLayout)
+    Assert-Equal '锚点相交回归：上方卡片仍使用上方横排' $overlapRect.Bottom 346
+    # 本次截图的紧凑定位回归，坐标仅作为离线几何样本；不读取截图中的账户值。
+    foreach ($scale in @(1.0, 1.25, 1.5, 2.0)) {
+        foreach ($origin in @(0, -1200)) {
+            $sample = [PetWindowInfo]::new()
+            $sample.Dpi = [uint32](96 * $scale)
+            $sample.WorkArea = [NativeWindow+RECT]@{ Left=$origin; Top=-100; Right=$origin+[int](600*$scale); Bottom=-100+[int](800*$scale) }
+            $sample.VisualRect = [NativeWindow+RECT]@{ Left=$origin+[int](134*$scale); Top=-100+[int](130*$scale); Right=$origin+[int](194*$scale); Bottom=-100+[int](242*$scale) }
+            $sample.TaskRect = [NativeWindow+RECT]@{ Left=$origin+[int](65*$scale); Top=-100+[int](48*$scale); Right=$origin+[int](265*$scale); Bottom=-100+[int](113*$scale) }
+            # 按钮及装饰的下缘远于角色，不得将竖排推到它们的下方。
+            $sample.ContentRect = [NativeWindow+RECT]@{ Left=$sample.TaskRect.Left; Top=$sample.TaskRect.Top; Right=$sample.TaskRect.Right; Bottom=-100+[int](285*$scale) }
+            $w = [int][math]::Round(96*$scale); $h = [int][math]::Round(232*$scale); $g = [int][math]::Round(8*$scale)
+            $r = [NativeWindow]::CalculateOverlayRect($sample, $w, $h, $g)
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 竖排贴角色右侧" $r.Left ($sample.VisualRect.Right+$g)
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 仅避开卡片下缘" $r.Top ($sample.TaskRect.Bottom+$g)
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 不掉到角色下方" ($r.Top -lt $sample.VisualRect.Bottom) $true
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 仍优先完整竖排" ([NativeWindow]::GetOverlayLayout($sample,$w,$h,$g)) ([OverlayLayout]::Vertical)
+            # 沿工作区中线镜像，包括任务卡、角色与按钮；顶部/底部决策对称。
+            $mirror = $sample.WorkArea.Top + $sample.WorkArea.Bottom
+            foreach ($name in @('VisualRect','TaskRect','ContentRect')) {
+                $v = $sample.$name; $t = $v.Top; $v.Top = $mirror-$v.Bottom; $v.Bottom = $mirror-$t; $sample.$name = $v
+            }
+            $mirrored = [NativeWindow]::CalculateOverlayRect($sample,$w,$h,$g)
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 上下镜像" $mirrored.Bottom ($mirror-$r.Top)
+            Assert-Equal "截图紧凑回归 $scale origin=$origin 镜像横坐标不变" $mirrored.Left $r.Left
+            # 最小避让后恰好能容纳竖排时不提前横排，缩小一像素才切换。
+            $area = $sample.WorkArea; $area.Top = $mirrored.Top; $sample.WorkArea = $area
+            Assert-Equal "竖排边界 $scale origin=$origin 刚好容纳" ([NativeWindow]::GetOverlayLayout($sample,$w,$h,$g)) ([OverlayLayout]::Vertical)
+            $area.Top++; $sample.WorkArea = $area
+            Assert-Equal "竖排边界 $scale origin=$origin 少一像素切换" ([NativeWindow]::GetOverlayLayout($sample,$w,$h,$g)) ([OverlayLayout]::Horizontal)
+        }
+    }
+    # 左右都没有完整竖排宽度，但横排可在上下容纳：不得覆盖角色或直接消失。
+    $sample = [PetWindowInfo]::new(); $sample.Dpi = 96
+    $sample.WorkArea = [NativeWindow+RECT]@{ Left=-250; Top=-100; Right=0; Bottom=600 }
+    $sample.VisualRect = [NativeWindow+RECT]@{ Left=-155; Top=200; Right=-95; Bottom=300 }
+    $sample.ContentRect = $sample.VisualRect
+    Assert-Equal '窄工作区两侧不足切横排' ([NativeWindow]::GetOverlayLayout($sample,96,232,8)) ([OverlayLayout]::Horizontal)
+    $r = [NativeWindow]::CalculateOverlayRect($sample,192,116,8,[OverlayLayout]::Horizontal)
+    Assert-Equal '窄工作区横排下方优先' $r.Top 308
+    Assert-Equal '窄工作区横排完整保留' ($r.Left -ge -250 -and $r.Right -le 0 -and $r.Right-$r.Left -eq 192) $true
+    # 横排不得只信任缺失/过时的 ContentRect，忽略独立任务卡或稳定角色锚点。
+    $sample.TaskRect = [NativeWindow+RECT]@{ Left=-240; Top=310; Right=-10; Bottom=360 }
+    $sample.ContentRect = [NativeWindow+RECT]::new()
+    $r = [NativeWindow]::CalculateOverlayRect($sample,192,116,8,[OverlayLayout]::Horizontal)
+    Assert-Equal '横排缺失内容边界仍包含角色和任务卡' $r.Top 368
+    $sample.TaskRect = [NativeWindow+RECT]::new()
+    $sample.ContentRect = [NativeWindow+RECT]@{ Left=-155; Top=220; Right=-95; Bottom=280 }
+    $r = [NativeWindow]::CalculateOverlayRect($sample,192,116,8,[OverlayLayout]::Horizontal)
+    Assert-Equal '横排内容小于稳定锚点仍不覆盖角色' $r.Top 308
+
     Write-Output '全部定位测试通过。'
     exit 0
 }
@@ -1194,6 +1728,14 @@ function Invoke-RateLimitProbe {
     }
 }
 
+if ($PingSettings) { Show-PingSettings; exit 0 }
+if ($CheckPingLogin) {
+    $status = Invoke-PingLoginCheck (Get-PingConfiguration)
+    Write-Output $status
+    if ($status -eq '额度访问验证通过（未发送模型请求）') { exit 0 }
+    exit 2
+}
+
 if ($ProbeOnce) {
     exit (Invoke-RateLimitProbe)
 }
@@ -1202,7 +1744,7 @@ function New-QuotaOverlayWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     # 两球共用结构；长余额自动缩放，球体尺寸保持不变。
     $orbTemplate = @'
-            <Grid Grid.Row="__ROW__">
+            <Grid x:Name="__PREFIX__Row" Grid.Row="__ROW__">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="88" />
                     <RowDefinition Height="4" />
@@ -1257,9 +1799,12 @@ function New-QuotaOverlayWindow {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Codex Pet Quota" Width="$script:PanelWidthDip" Height="$script:PanelHeightDip"
         WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True" Background="Transparent"
-        ShowInTaskbar="False" ShowActivated="False" Focusable="False" Topmost="True"
+        ShowInTaskbar="False" ShowActivated="False" Focusable="False" Topmost="False"
         FontFamily="Segoe UI, Microsoft YaHei UI" UseLayoutRounding="True">
-    <Grid Margin="4">
+    <Grid Margin="4" Tag="Vertical">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="88" />
+        </Grid.ColumnDefinitions>
         <Grid.RowDefinitions>
             <RowDefinition Height="108" />
             <RowDefinition Height="8" />
@@ -1273,6 +1818,33 @@ function New-QuotaOverlayWindow {
     $reader = [Xml.XmlNodeReader]::new($xaml)
     try { return [Windows.Markup.XamlReader]::Load($reader) }
     finally { $reader.Close() }
+}
+
+function Set-QuotaLayout {
+    param($Window, [bool]$Horizontal)
+    $layout = if ($Horizontal) { 'Horizontal' } else { 'Vertical' }
+    $root = $Window.Content
+    if ($root.Tag -eq $layout) { return }
+    $root.RowDefinitions.Clear()
+    $root.ColumnDefinitions.Clear()
+    $rowHeights = if ($Horizontal) { @(108) } else { @(108, 8, 108) }
+    $columnWidths = if ($Horizontal) { @(88, 8, 88) } else { @(88) }
+    foreach ($height in $rowHeights) {
+        $row = [Windows.Controls.RowDefinition]::new()
+        $row.Height = [Windows.GridLength]::new($height)
+        $root.RowDefinitions.Add($row)
+    }
+    foreach ($width in $columnWidths) {
+        $column = [Windows.Controls.ColumnDefinition]::new()
+        $column.Width = [Windows.GridLength]::new($width)
+        $root.ColumnDefinitions.Add($column)
+    }
+    $week = $Window.FindName('WeekRow')
+    [Windows.Controls.Grid]::SetRow($week, $(if ($Horizontal) { 0 } else { 2 }))
+    [Windows.Controls.Grid]::SetColumn($week, $(if ($Horizontal) { 2 } else { 0 }))
+    $Window.Width = if ($Horizontal) { $script:HorizontalPanelWidthDip } else { $script:PanelWidthDip }
+    $Window.Height = if ($Horizontal) { $script:HorizontalPanelHeightDip } else { $script:PanelHeightDip }
+    $root.Tag = $layout
 }
 
 function Get-MetricColor {
@@ -1392,25 +1964,114 @@ if ($UiSelfTest) {
                     Assert-Equal '恢复后重置说明' ($testWindow.FindName('FiveReset').Text -match '^重置 ') $true
                 }
             }
-            if ($PreviewDirectory) {
-                $scales = @(1.0)
-                if ($mode -eq 'quota' -or $mode -eq 'credits' -or $mode -eq 'reconnecting') { $scales = @(1.0, 1.25, 1.5, 2.0) }
-                foreach ($scale in $scales) {
-                    $bitmap = [Windows.Media.Imaging.RenderTargetBitmap]::new(
-                        [int]($size.Width * $scale), [int]($size.Height * $scale),
-                        96.0 * $scale, 96.0 * $scale, [Windows.Media.PixelFormats]::Pbgra32)
-                    $bitmap.Render($root)
-                    $encoder = [Windows.Media.Imaging.PngBitmapEncoder]::new()
-                    $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
-                    $output = Join-Path $PreviewDirectory ("$mode-" + [int]($scale * 100) + '.png')
-                    $stream = [IO.File]::Create($output)
-                    try { $encoder.Save($stream) } finally { $stream.Dispose() }
+            foreach ($horizontal in @($true, $false)) {
+                Set-QuotaLayout -Window $testWindow -Horizontal $horizontal
+                $layoutSize = [Windows.Size]::new($testWindow.Width, $testWindow.Height)
+                $root.Measure($layoutSize)
+                $root.Arrange([Windows.Rect]::new($layoutSize))
+                $root.UpdateLayout()
+                $fivePoint = $fiveOrb.TranslatePoint($origin, $root)
+                $weekPoint = $weekOrb.TranslatePoint($origin, $root)
+                $layoutName = if ($horizontal) { '横排' } else { '恢复竖排' }
+                if ($horizontal) {
+                    Assert-Equal "$mode $layoutName 双球左右排列" ($weekPoint.X -gt ($fivePoint.X + $fiveOrb.ActualWidth) -and $weekPoint.Y -eq $fivePoint.Y) $true
+                    Assert-Equal "$mode $layoutName 高度减半" $testWindow.Height $script:HorizontalPanelHeightDip
+                }
+                else {
+                    Assert-Equal "$mode $layoutName 双球上下排列" ($weekPoint.Y -gt ($fivePoint.Y + $fiveOrb.ActualHeight) -and $weekPoint.X -eq $fivePoint.X) $true
+                    Assert-Equal "$mode $layoutName 恢复宽度" $testWindow.Width $script:PanelWidthDip
+                }
+                Assert-Equal "$mode $layoutName 球体尺寸不变" $fiveOrb.ActualWidth 88.0
+                $weekReset = $testWindow.FindName('WeekReset')
+                $resetPoint = $weekReset.TranslatePoint($origin, $root)
+                Assert-Equal "$mode $layoutName 重置文字仍在窗口内" ($resetPoint.X -ge 0 -and $resetPoint.Y -ge 0 -and $resetPoint.X+$weekReset.ActualWidth -le $layoutSize.Width -and $resetPoint.Y+$weekReset.ActualHeight -le $layoutSize.Height) $true
+                if ($PreviewDirectory) {
+                    $scales = @(1.0)
+                    if ($mode -eq 'quota' -or $mode -eq 'credits' -or $mode -eq 'reconnecting') { $scales = @(1.0, 1.25, 1.5, 2.0) }
+                    foreach ($scale in $scales) {
+                        $bitmap = [Windows.Media.Imaging.RenderTargetBitmap]::new(
+                            [int]($layoutSize.Width * $scale), [int]($layoutSize.Height * $scale),
+                            96.0 * $scale, 96.0 * $scale, [Windows.Media.PixelFormats]::Pbgra32)
+                        $bitmap.Render($root)
+                        $encoder = [Windows.Media.Imaging.PngBitmapEncoder]::new()
+                        $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+                        $prefix = if ($horizontal) { 'horizontal-' } else { '' }
+                        $output = Join-Path $PreviewDirectory ($prefix + "$mode-" + [int]($scale * 100) + '.png')
+                        $stream = [IO.File]::Create($output)
+                        try { $encoder.Save($stream) } finally { $stream.Dispose() }
+                    }
                 }
             }
         }
+        # 使用全透明测试窗验证原生定位链路，不移动桌宠、不读取账户。
+        $testWindow.Opacity = 0
+        $testWindow.Show()
+        $testHandle = ([Windows.Interop.WindowInteropHelper]::new($testWindow)).Handle
+        $testVisualScale = [Windows.PresentationSource]::FromVisual($testWindow).CompositionTarget.TransformToDevice.M11
+        $flags = [Reflection.BindingFlags]'NonPublic, Static'
+        $isVisible = [NativeWindow].GetMethod('IsWindowVisible', $flags)
+        $getRect = [NativeWindow].GetMethod('GetWindowRect', $flags)
+        $positionPet = [PetWindowInfo]::new()
+        $zPetWindow = [Windows.Window]::new()
+        $zPetWindow.WindowStyle = 'None'; $zPetWindow.AllowsTransparency = $true
+        $zPetWindow.Opacity = 0; $zPetWindow.ShowActivated = $false
+        $zPetWindow.ShowInTaskbar = $false
+        $zPetWindow.Show()
+        $positionPet.Handle = ([Windows.Interop.WindowInteropHelper]::new($zPetWindow)).Handle
+        $positionPet.Dpi = 96
+        $positionPet.VisualRect = [NativeWindow+RECT]@{ Left=8; Top=350; Right=68; Bottom=450 }
+        $positionPet.ContentRect = [NativeWindow+RECT]@{ Left=8; Top=350; Right=228; Bottom=510 }
+        $positionPet.TaskRect = [NativeWindow+RECT]@{ Left=8; Top=470; Right=228; Bottom=510 }
+        $positionPet.WorkArea = [NativeWindow+RECT]@{ Left=0; Top=0; Right=1200; Bottom=800 }
+        foreach ($state in @('visible', 'blocked', 'restored')) {
+            $positionPet.ContentRect = if ($state -eq 'blocked') { $positionPet.WorkArea } else { [NativeWindow+RECT]@{ Left=8; Top=350; Right=228; Bottom=510 } }
+            $positionPet.TaskRect = if ($state -eq 'blocked') { $positionPet.WorkArea } else { [NativeWindow+RECT]@{ Left=8; Top=470; Right=228; Bottom=510 } }
+            [NativeWindow]::PositionOverlay($testHandle, $positionPet, $script:PanelWidthDip, $script:PanelHeightDip, $script:PanelGapDip, $testVisualScale)
+            Assert-Equal "原生窗口 $state 可见状态" ($isVisible.Invoke($null, [object[]]@($testHandle))) ($state -ne 'blocked')
+            if ($state -ne 'blocked') {
+                $rectArgs = [object[]]@($testHandle, [NativeWindow+RECT]::new())
+                Assert-Equal "原生窗口 $state 读取实际坐标" ($getRect.Invoke($null, $rectArgs)) $true
+                $expected = [NativeWindow]::CalculateOverlayRect($positionPet, [int][math]::Round($script:PanelWidthDip*$testVisualScale), [int][math]::Round($script:PanelHeightDip*$testVisualScale), [int]$script:PanelGapDip)
+                Assert-Equal "原生窗口 $state 保留信息框边界" ($rectArgs[1].Equals($expected)) $true
+            }
+        }
+        # 横竖切换同时验证原生窗口大小，避免只换坐标却仍保留竖排尺寸。
+        foreach ($layout in @([OverlayLayout]::Horizontal, [OverlayLayout]::Vertical)) {
+            Set-QuotaLayout -Window $testWindow -Horizontal ($layout -eq [OverlayLayout]::Horizontal)
+            $widthDip = $testWindow.Width; $heightDip = $testWindow.Height
+            $expected = [NativeWindow]::CalculateOverlayRect($positionPet, [int][math]::Round($widthDip*$testVisualScale), [int][math]::Round($heightDip*$testVisualScale), [int]$script:PanelGapDip, $layout)
+            [NativeWindow]::PositionOverlay($testHandle, $positionPet, $widthDip, $heightDip, $script:PanelGapDip, $testVisualScale, $layout)
+            $rectArgs = [object[]]@($testHandle, [NativeWindow+RECT]::new())
+            Assert-Equal "原生窗口 $layout 切换后可见" ($isVisible.Invoke($null, [object[]]@($testHandle))) $true
+            Assert-Equal "原生窗口 $layout 读取切换坐标" ($getRect.Invoke($null, $rectArgs)) $true
+            Assert-Equal "原生窗口 $layout 横竖切换尺寸与坐标" ($rectArgs[1].Equals($expected)) $true
+            Assert-Equal "原生窗口 $layout 逻辑宽度不漂移" $testWindow.Width $widthDip
+            Assert-Equal "原生窗口 $layout 逻辑高度不漂移" $testWindow.Height $heightDip
+        }
+        # 使用真实透明 HWND 测试分组切换，不移动用户窗口、不读取账户。
+        [NativeWindow]::MakeOverlayClickThrough($testHandle)
+        $getWindow = [NativeWindow].GetMethod('GetWindow', $flags)
+        $getStyle = [NativeWindow].GetMethod('GetWindowLongPtr', $flags)
+        $getForeground = [NativeWindow].GetMethod('GetForegroundWindow', $flags)
+        foreach ($topmost in @($false, $true, $false, $true, $false)) {
+            $zPetWindow.Topmost = $topmost
+            $foreground = $getForeground.Invoke($null, @())
+            [NativeWindow]::PositionOverlay($testHandle, $positionPet, $script:PanelWidthDip, $script:PanelHeightDip, $script:PanelGapDip, $testVisualScale)
+            $style = $getStyle.Invoke($null, [object[]]@($testHandle, -20)).ToInt64()
+            Assert-Equal "Z 序 topmost=$topmost 分组一致" (($style -band 8) -ne 0) $topmost
+            Assert-Equal "Z 序 topmost=$topmost 紧随宠物" ($getWindow.Invoke($null, [object[]]@($testHandle, [uint32]3))) $positionPet.Handle
+            Assert-Equal "Z 序 topmost=$topmost 不抢焦点" ($getForeground.Invoke($null, @())) $foreground
+            Assert-Equal "Z 序 topmost=$topmost 保留穿透" (($style -band 0x08000020) -eq 0x08000020) $true
+        }
+        $zPetWindow.Hide()
+        [NativeWindow]::PositionOverlay($testHandle, $positionPet, $script:PanelWidthDip, $script:PanelHeightDip, $script:PanelGapDip, $testVisualScale)
+        Assert-Equal '宠物隐藏后球同步隐藏' ($isVisible.Invoke($null, [object[]]@($testHandle))) $false
+        $zPetWindow.Show()
+        [NativeWindow]::PositionOverlay($testHandle, $positionPet, $script:PanelWidthDip, $script:PanelHeightDip, $script:PanelGapDip, $testVisualScale)
+        Assert-Equal '宠物恢复后球同步恢复' ($isVisible.Invoke($null, [object[]]@($testHandle))) $true
         Write-Output '全部 WPF 渲染测试通过。'
     }
-    finally { $testWindow.Close() }
+    finally { if ($null -ne $zPetWindow) { $zPetWindow.Close() }; $testWindow.Close() }
     exit 0
 }
 
@@ -1443,7 +2104,8 @@ try {
     $script:RestartIndex = 0
     $script:RequestId = 1
     $restartDelays = @(5, 15, 30, 60)
-    $codexExecutable = Resolve-CodexExecutable
+    Initialize-QuotaPing
+    $codexExecutable = if ($script:PingConfiguration.Enabled -and $script:PingConfiguration.Valid) { Resolve-PingCodexExecutable } else { Resolve-CodexExecutable }
 
     function Set-ReconnectingUi {
         $unavailable = [pscustomobject]@{ Available = $false; ResetText = '正在重连' }
@@ -1453,7 +2115,10 @@ try {
 
     function Start-AppServer {
         try {
-            $client.Start($codexExecutable, $PSScriptRoot)
+            if ($script:PingConfiguration.Enabled -and $script:PingConfiguration.Valid) {
+                $client.StartWithHome($codexExecutable, $PSScriptRoot, $script:PingConfiguration.CodexHome)
+            }
+            else { $client.Start($codexExecutable, $PSScriptRoot) }
             $script:Initialized = $false
             $script:ReadPending = $false
             $script:ResponseDeadline = [DateTime]::UtcNow.AddSeconds(25)
@@ -1475,6 +2140,10 @@ try {
     }
 
     function Stop-AppServerForRetry {
+        # 断线后重新积累候选证据；不跨连接保留短轮询锚点。
+        $script:PingReadSchedule = New-PingReadSchedule
+        $script:PingState.PreviousAt = 0L
+        $script:PingState.PreviousReset = 0L
         $client.Stop()
         $script:Initialized = $false
         $script:ReadPending = $false
@@ -1492,6 +2161,7 @@ try {
         $script:RequestId++
         $client.SendLine((New-JsonLine -Id $script:RequestId -Method 'account/rateLimits/read' -OmitParams))
         $script:ReadPending = $true
+        if ($script:PingRuntimeEnabled) { Write-PingEvent 'quota_read_started' ('rpc_' + $script:RequestId) }
         $script:ResponseDeadline = [DateTime]::UtcNow.AddSeconds(25)
     }
 
@@ -1509,6 +2179,8 @@ try {
             return
         }
 
+        Update-QuotaPingProcess
+
         $pet = [NativeWindow]::FindPetWindow($script:LastPetHandle)
         if ($null -eq $pet) {
             $script:LastPetHandle = [IntPtr]::Zero
@@ -1519,6 +2191,7 @@ try {
         }
         else {
             $script:LastPetHandle = $pet.Handle
+            $positionPet = [NativeWindow]::GetAnchoredPet($pet)
             if (-not $script:OverlayVisible) {
                 $window.Show()
                 $script:OverlayVisible = $true
@@ -1532,13 +2205,24 @@ try {
             if ($null -ne $presentationSource -and $null -ne $presentationSource.CompositionTarget) {
                 $overlayVisualScale = $presentationSource.CompositionTarget.TransformToDevice.M11
             }
+            # 每一帧先尝试完整竖排；只有当前几何确实放不下时才改为横排。
+            # 不缓存上一次方向，因此回到有空间的位置会立即恢复竖排，上下侧使用同一判定。
+            $verticalWidthPixels = [int][math]::Round($script:PanelWidthDip * $overlayVisualScale)
+            $verticalHeightPixels = [int][math]::Round($script:PanelHeightDip * $overlayVisualScale)
+            $gapPixels = [int][math]::Round($script:PanelGapDip * ($pet.Dpi / 96.0))
+            $layout = [NativeWindow]::GetOverlayLayout($positionPet, $verticalWidthPixels, $verticalHeightPixels, $gapPixels)
+            $horizontal = $layout -eq [OverlayLayout]::Horizontal
+            Set-QuotaLayout -Window $window -Horizontal $horizontal
+            $widthDip = if ($horizontal) { $script:HorizontalPanelWidthDip } else { $script:PanelWidthDip }
+            $heightDip = if ($horizontal) { $script:HorizontalPanelHeightDip } else { $script:PanelHeightDip }
             [NativeWindow]::PositionOverlay(
                 $script:OverlayHandle,
-                $pet,
-                $script:PanelWidthDip,
-                $script:PanelHeightDip,
+                $positionPet,
+                $widthDip,
+                $heightDip,
                 $script:PanelGapDip,
-                $overlayVisualScale
+                $overlayVisualScale,
+                $layout
             )
         }
 
@@ -1577,6 +2261,7 @@ try {
             }
 
             if ($script:ReadPending -and $id -eq $script:RequestId) {
+                if ($script:PingRuntimeEnabled) { Write-PingEvent 'quota_read_received' ('rpc_' + $id) }
                 $script:ReadPending = $false
                 $script:ResponseDeadline = [DateTime]::MinValue
                 try {
@@ -1587,6 +2272,7 @@ try {
                         $script:RestartIndex = 0
                     }
                     $script:NextReadAt = [DateTime]::UtcNow.AddSeconds(60)
+                    Update-QuotaPingSnapshot $message
                 }
                 catch {
                     Stop-AppServerForRetry
@@ -1622,6 +2308,8 @@ try {
     [void]$application.Run()
 }
 finally {
+    try { Stop-QuotaPing } catch { }
+    try { if ($null -ne $script:PingTransport) { $script:PingTransport.Dispose() } } catch { }
     try { $client.Dispose() } catch { }
     try { $stopEvent.Dispose() } catch { }
     try { $mutex.ReleaseMutex() } catch { }

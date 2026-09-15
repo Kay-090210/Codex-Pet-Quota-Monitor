@@ -23,6 +23,11 @@ if ($errors.Count -gt 0) {
 }
 Write-Output 'PASS PowerShell 语法检查'
 
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -STA -File (Join-Path $PSScriptRoot 'Test-CodexQuotaPing.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Ping 策略测试失败，退出码：$LASTEXITCODE" }
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -STA -File (Join-Path $PSScriptRoot 'Test-CodexPingTransport.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Ping 传输测试失败，退出码：$LASTEXITCODE" }
+
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -STA -File $mainScript -SelfTest
 if ($LASTEXITCODE -ne 0) {
     throw "内置测试失败，退出码：$LASTEXITCODE"

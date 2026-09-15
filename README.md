@@ -21,9 +21,12 @@ A lightweight Windows overlay that follows the Codex Desktop pet and displays th
 - 同时显示 5 小时额度和周额度的剩余百分比与重置时间。
 - 只有在 5 小时额度实际耗尽后，才将上方额度球切换为积分余额。
 - 额度恢复后自动切回 5 小时额度；连接异常时清空旧数据并显示“正在重连”。
-- 每 60 秒刷新一次；连接失败后按 5、15、30、60 秒逐级重试。
-- 悬浮窗跟随桌宠移动，并根据可用工作区自动放到桌宠左侧或右侧。
-- 支持多显示器和 DPI 缩放；窗口置顶、鼠标穿透、不抢焦点且不出现在任务栏中。
+- 常态每 60 秒刷新一次；启用可选 ping 后，重置附近会提前只读查询，首次空闲候选后 33 秒确认；连接失败后按 5、15、30、60 秒逐级重试。
+- 悬浮窗常态下以 8 DIP 间距贴近桌宠右侧；右侧空间不足时沿用原有规则，自动翻到桌宠左侧。
+- 任务信息框出现后保持上述左右选择，从角色旁的居中位置做最小避让：上方卡片限制竖排上缘，下方卡片限制竖排下缘，保留 8 DIP 间距。只避开任务卡，不把角色、按钮和装饰的整体边界当成卡片，避免额度 UI 远落到角色上方或下方。
+- 每个采样周期都先计算任务卡对侧的完整竖排位置；对侧竖排放不下时才切换为任务卡同侧横排。无任务卡时仍先尝试角色旁的完整竖排，横排下方可完整容纳时优先放在下方，否则尝试上方。允许的配对方向均无空间时临时隐藏，空间恢复后的当前周期立即恢复显示，不沿用历史方向。
+- 角色左右都放不下完整竖排时，转而尝试横排，不通过横坐标钳位把额度 UI 压到角色身上；横排边界同时包含任务卡、实际内容与稳定角色锚点。
+- 支持多显示器和 DPI 缩放；窗口每 250 毫秒同步到桌宠之后的相邻 Z 序（跟随其置顶/非置顶状态，不独立抢占最上层）、鼠标穿透、不抢焦点且不出现在任务栏中。
 - 单实例运行；桌宠窗口不可见时自动隐藏额度悬浮窗。
 
 ### 运行要求
@@ -53,6 +56,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\CodexPetQuota.ps1
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\CodexPetQuota.ps1 -Stop
 ```
+
+### 可选：自动启动空闲 5H 窗口
+
+双击 `Configure-CodexPetQuota.cmd` 设置。默认关闭；通过 Codex CLI 登录独立环境后，可启用“额度读取发现未启动窗口才 ping”。**无需另外安装 limitping，不按固定五小时定时发送，也不发测试消息来判断登录。** 内置 helper 复用其实际 CLI 单回合路径。 使用连续两次额度采样、防重发和失败保护；实际 ping 会消耗少量额度。
+
+启用时，额度显示与 ping 使用所选同一登录环境。开关、入口、检测条件、凭证检查及验证限制见 [详细说明](docs/optional-window-ping.md)。
 
 ### 显示规则
 
@@ -102,7 +111,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Test-CodexPetQuot
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Test-CodexPetQuota.ps1
 ```
 
-测试覆盖 PowerShell 语法、额度数据映射、异常值、积分切换、桌宠锚点、左右放置、100%/125%/150%/200% DPI 缩放，以及 WPF 布局渲染。
+测试覆盖 PowerShell 语法、额度数据映射、异常值、积分切换、桌宠锚点、左右放置、贴边信息框偏移/变宽/消失、任务卡上下方向与横竖布局配对、截图紧凑定位及上下镜像、最小避让一像素临界值、外部按压经过角色不误触拖动、锚点轻微相交回归、竖排空间动态判定、原 35% 分界位置不提前横排、顶部/底部镜像触发、恢复空间后立即切回竖排、无任务卡时的横排下方优先及上方回退、负坐标工作区、窄屏避让与隐藏恢复、100%/125%/150%/200% DPI 缩放、WPF 横竖布局渲染及原生窗口位置/尺寸切换。
 
 ### 文件说明
 
@@ -113,6 +122,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Test-CodexPetQuot
 | `Run-CodexPetQuotaHidden.vbs` | 隐藏 PowerShell 宿主窗口 |
 | `Stop-CodexPetQuota.cmd` | 向运行实例发送停止信号 |
 | `Test-CodexPetQuota.ps1` | 离线测试和只读集成测试入口 |
+| `Configure-CodexPetQuota.cmd` | 可选 ping 设置、CLI 登录和只读凭证检查 |
+| `CodexQuotaPing.ps1` / `CodexPingTransport.cs` | 窗口检测、防重发与内置 Go helper 进程管理 |
+| `Test-CodexQuotaPing.ps1` | ping 策略与持久化的独立离线测试 |
 | `docs/images/` | README 使用的测试数据截图 |
 
 ### 已知限制
@@ -137,9 +149,12 @@ The three screenshots above use test data and contain no real account informatio
 - Shows remaining percentages and reset times for both the five-hour and weekly limits.
 - Switches the upper orb to the credit balance only after the five-hour limit is actually exhausted.
 - Returns to the five-hour view when the limit recovers and clears stale values while reconnecting.
-- Refreshes every 60 seconds and retries failed connections after 5, 15, 30, and 60 seconds.
-- Follows the Codex Desktop pet and automatically chooses the left or right side based on the available work area.
-- Supports multiple monitors and DPI scaling; the overlay is topmost, click-through, non-activating, and hidden from the taskbar.
+- Normally refreshes every 60 seconds; optional ping uses reset-aware reads and 33-second candidate confirmation. Retries failed connections after 5, 15, 30, and 60 seconds.
+- Normally stays close to the pet's right side with an 8-DIP gap, retaining the original fallback to the left when the right side has insufficient room.
+- When the task card appears, keeps that left/right choice and applies only the minimum vertical shift from the pet-centered position: below an upper card or above a lower card, with an 8-DIP clearance. It avoids the card itself, not the combined bounds of the pet, controls, and decorations, so the stack stays close to the pet.
+- Re-evaluates a complete safe vertical placement on every sample and switches to a horizontal row only when the vertical stack does not fit. With a card, the stack stays on the opposite side of the card and the row uses the same side as the card. Without a card, the row prefers below, then above. The overlay temporarily hides if the permitted placements do not fit and immediately restores the vertical layout when space returns.
+- If neither side has enough width for the stack, it tries a row rather than clamping the stack over the pet. Horizontal placement includes the task card, current content, and stable pet anchor in its obstacle bounds.
+- Supports multiple monitors and DPI scaling; the overlay follows immediately behind the pet in Z order every 250 ms (including its topmost/non-topmost state, without independently raising itself to the top), click-through, non-activating, and hidden from the taskbar.
 - Runs as a single instance and hides automatically when the pet window is unavailable.
 
 ### Requirements
@@ -169,6 +184,10 @@ To stop the running instance:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\CodexPetQuota.ps1 -Stop
 ```
+
+### Optional idle-window ping
+
+Open `Configure-CodexPetQuota.cmd`. This feature is off by default, uses a bundled helper reusing limitping’s CLI provider (no separate limitping installation), and detects an idle five-hour window from consecutive quota reads rather than a fixed timer. Login checks do not send model requests; actual pings consume quota. When enabled, the overlay and ping use the same selected profile. See [configuration, safeguards and limitations](docs/optional-window-ping.md#english).
 
 ### Display behavior
 
@@ -218,7 +237,7 @@ Run the complete read-only integration test, which also prints the current accou
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Test-CodexPetQuota.ps1
 ```
 
-The suite covers PowerShell syntax, quota mapping, invalid values, credit switching, pet anchoring, left/right placement, 100%/125%/150%/200% DPI scaling, and WPF layout rendering.
+The suite covers PowerShell syntax, quota mapping, invalid values, credit switching, pet anchoring, left/right placement, shifted/resized/dismissed task cards near screen edges, compact screenshot regression, mirrored minimal card avoidance, one-pixel fit boundaries, rejecting drag gestures started outside the pet, dynamic vertical-space decisions, no premature switch at the former 35% boundaries, mirrored top/bottom triggers, immediate vertical recovery when room returns, below-first horizontal placement with an above fallback, negative-coordinate work areas, narrow-screen avoidance and hide/recovery placement, 100%/125%/150%/200% DPI scaling, WPF rendering in both orientations, and native window position/size transitions.
 
 ### Project files
 
